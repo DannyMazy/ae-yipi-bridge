@@ -192,7 +192,7 @@ function buildPayload(contact, customFields, opportunity, notes, encryptedPii) {
     property_address: customFields['property_address'] || contact.address1    || '',
     property_city:    customFields['property_city']    || contact.city        || '',
     property_state:   customFields['property_state']   || contact.state       || '',
-    property_zip:     customFields['property_zip']     || contact.postalCode  || '',
+    property_zip:     customFields['property_zip']     || contact.postalCode  || contact.postal_code || '',
     property_type:    customFields['property_type']    || '',
 
     loan_type:              customFields['loan_type']   || 'home_equity',
@@ -264,8 +264,8 @@ export async function handler(req, res) {
   // Supported shapes (in priority order):
   //   body.contact.id       — "Contact Created/Updated" trigger
   //   body.contactId        — some workflow webhook steps
-  //   body.contact_id       — snake_case variant
-  //   body.id               — bare-id shape (pipeline stage webhooks)
+  //   body.contact_id       — flat workflow webhook (snake_case)
+  //   body.id               — bare-id shape
   //   body.data.contact.id  — wrapped envelope
   const contactId =
     body?.contact?.id   ||
@@ -292,14 +292,36 @@ export async function handler(req, res) {
       fetchNotes(contactId),
     ]);
 
-    const contact      = fullContact || body.contact || {};
+    // GHL workflow webhooks send a flat payload — all fields at root level.
+    // If the GHL API fetch fails (401/403), fall back to flat webhook fields.
+    const flatContact = {
+      id:         contactId,
+      firstName:  body.first_name  || body.firstName  || '',
+      lastName:   body.last_name   || body.lastName   || '',
+      email:      body.email       || '',
+      phone:      body.phone       || '',
+      address1:   body.address1    || body.full_address || '',
+      city:       body.city        || '',
+      state:      body.state       || '',
+      postalCode: body.postal_code || body.postalCode  || '',
+      source:     body.contact_source || body.source   || '',
+      customFields: [],
+    };
+
+    const contact = fullContact || body.contact || flatContact;
+    // Always ensure contact.id is set — it becomes Yipi's user_id
+    if (!contact.id) contact.id = contactId;
+
     const customFields = flattenCustomFields(contact);
-    const opportunity  = body.opportunity || {};
+    const opportunity  = body.opportunity || {
+      id:            body.id         || null,
+      monetaryValue: body.lead_value || null,
+    };
 
     // 4. Build encrypted PII block
     const sensitiveFields = {
-      email: contact.email || body.contact?.email || null,
-      phone: contact.phone || body.contact?.phone || null,
+      email: contact.email || body.email || null,
+      phone: contact.phone || body.phone || null,
 
       ...(contact.dateOfBirth && { date_of_birth: contact.dateOfBirth }),
       ...(customFields['date_of_birth'] && { date_of_birth: customFields['date_of_birth'] }),
@@ -335,6 +357,7 @@ export async function handler(req, res) {
 
     console.log(
       `[bridge] Submitting to Yipi — user_id: ${yipiPayload.user_id}`,
+      `| name: ${yipiPayload.application_data.first_name} ${yipiPayload.application_data.last_name}`,
       `| notes: ${notes.length}`,
       `| address: ${yipiPayload.application_data.property_address || 'unknown'}`
     );
@@ -355,7 +378,7 @@ export async function handler(req, res) {
       });
     }
 
-    console.error(`[bridge] ❌ Yipi error ${status}:`, yipiRes);
+    console.error(`[bridge] ❌ Yipi error ${status}:`, JSON.stringify(yipiRes, null, 2));
     return res.status(502).json({ success: false, yipiStatus: status, yipiError: yipiRes });
 
   } catch (err) {
