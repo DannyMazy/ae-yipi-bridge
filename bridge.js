@@ -395,7 +395,7 @@ export async function handler(req, res) {
     }).then(r => console.log('[bridge] Sheets write status: ' + r.status))
       .catch(e => console.warn('[bridge] Sheets write failed:', e.message));
 
-    if (status === 201 || status === 200) {
+    if (status === 200 || status === 201 || status === 202) {
       console.log(
         `[bridge] ✅ Success — dealId: ${yipiRes.dealId}`,
         `| duplicate: ${yipiRes.duplicate}`
