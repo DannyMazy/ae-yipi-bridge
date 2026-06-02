@@ -365,6 +365,36 @@ export async function handler(req, res) {
     // 7. Post to Yipi
     const { status, body: yipiRes } = await postToYipi(yipiPayload);
 
+    // 8. Write to Google Sheets (fire-and-forget — never blocks Yipi response)
+    const SHEETS_URL = 'https://script.google.com/macros/s/AKfycbx0kgbXBQckPA5lRPHcYplHcmIdH0fFB8jYRZUPNjaLw4idUh34KjNuZJ-56VJz8jyI/exec';
+    const sheetsPayload = {
+      first_name:       contact.firstName  || contact.first_name || '',
+      last_name:        contact.lastName   || contact.last_name  || '',
+      email:            contact.email      || body.email         || '',
+      phone:            contact.phone      || body.phone         || '',
+      property_address: yipiPayload.application_data.property_address || '',
+      property_city:    yipiPayload.application_data.property_city    || '',
+      property_state:   yipiPayload.application_data.property_state   || '',
+      property_zip:     yipiPayload.application_data.property_zip     || '',
+      estimated_value:  body['What is Your Estimate Propoerty Value'] || body['What is Your Estimated Property Value?'] || '',
+      mortgage_balance: body['What is Your Mortgage Balance?'] || '',
+      requested_amount: yipiPayload.application_data.requested_loan_amount || '',
+      funding_reason:   body['What will the funding be used for?'] || body['How Do You Plan to Repay?'] || '',
+      timing:           body['How Long Will You need This Funding?'] || '',
+      exit_plan:        '',
+      deal_notes:       notes.map(n => '[' + (n.date ? new Date(n.date).toLocaleDateString('en-US') : 'No date') + ']\n' + n.body).join('\n\n'),
+      notes_count:      notes.length,
+      ghl_contact_id:   contactId,
+      deal_id:          yipiRes?.dealId || '',
+      duplicate:        yipiRes?.duplicate || false,
+    };
+    fetch(SHEETS_URL, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(sheetsPayload),
+    }).then(r => console.log('[bridge] Sheets write status: ' + r.status))
+      .catch(e => console.warn('[bridge] Sheets write failed:', e.message));
+
     if (status === 201 || status === 200) {
       console.log(
         `[bridge] ✅ Success — dealId: ${yipiRes.dealId}`,
