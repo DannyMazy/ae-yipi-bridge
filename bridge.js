@@ -858,12 +858,29 @@ async function logToSheet(contact, body, yipiPayload, notes, contactId, yipiRes,
 // ─── ROUTER (used by server.js) ──────────────────────────────────
 export async function route(path, req, res, query) {
   const p = (path || '/').replace(/\/+$/, '') || '/';
+  const q = query || new URLSearchParams();
+
+  // Query-param auth alternative (?key=...) — used by the Afford Equity
+  // deals dashboard, whose fetch layer cannot set custom headers.
+  if (BRIDGE_SECRET && q.get('key') === BRIDGE_SECRET && !req.headers['x-bridge-secret']) {
+    req.headers['x-bridge-secret'] = BRIDGE_SECRET;
+  }
+
   if (req.method === 'GET') {
     if (p === '/yipi/deals') {
-      return handleYipiDeals(req, res, query || new URLSearchParams());
+      return handleYipiDeals(req, res, q);
     }
     if (p === '/yipi/registry') {
-      return handleYipiRegistry(req, res, query || new URLSearchParams());
+      return handleYipiRegistry(req, res, q);
+    }
+    if (p === '/yipi/retract') {
+      // GET variant of withdraw for the dashboard: /yipi/retract?dealId=...&key=...
+      if (!q.get('dealId')) return res.status(400).json({ error: 'dealId query param required' });
+      req.body = JSON.stringify({
+        dealId: q.get('dealId'),
+        reason: q.get('reason') || 'Retracted from Afford Equity deals dashboard',
+      });
+      return handleYipiWithdraw(req, res);
     }
     return res.status(405).json({ error: 'Method not allowed' });
   }
