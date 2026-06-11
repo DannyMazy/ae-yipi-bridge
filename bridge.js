@@ -637,9 +637,20 @@ async function mapWithConcurrency(items, limit, fn) {
 export async function handleYipiRegistry(req, res, query) {
   if (!authorize(req, res)) return;
 
+  // Optional pagination (?page=&perPage=) — keeps responses small for
+  // fetch layers that drop large bodies (the dashboard reads 20 at a time).
+  const paginate = (payload) => {
+    const perRaw = parseInt(query.get('perPage') || '0', 10);
+    if (!perRaw) return payload; // no pagination requested -> full payload
+    const per = Math.min(50, Math.max(1, perRaw));
+    const page = Math.max(1, parseInt(query.get('page') || '1', 10));
+    const items = payload.items.slice((page - 1) * per, page * per);
+    return { ...payload, items, page, perPage: per, totalPages: Math.max(1, Math.ceil(payload.items.length / per)) };
+  };
+
   const force = query.get('refresh') === '1';
   if (!force && _registryCache.data && Date.now() - _registryCache.at < 60_000) {
-    return res.status(200).json({ ..._registryCache.data, cached: true });
+    return res.status(200).json({ ...paginate(_registryCache.data), cached: true });
   }
 
   try {
@@ -685,7 +696,7 @@ export async function handleYipiRegistry(req, res, query) {
     };
     _registryCache = { at: Date.now(), data: payload };
     console.log(`[bridge] registry: ${candidates.length} contacts checked, ${deals.length} deals on Yipi`);
-    return res.status(200).json(payload);
+    return res.status(200).json(paginate(payload));
   } catch (err) {
     console.error('[bridge] Fatal error (registry):', err);
     return res.status(500).json({ error: err.message });
