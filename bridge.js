@@ -544,6 +544,154 @@ export async function handleYipiDeals(req, res, query) {
   }
 }
 
+// ─── HANDLER: YIPI REGISTRY (originator-side deal visibility) ────
+// Yipi's GET /api/deals is investor-scoped (originators get an empty list),
+// so we build the registry ourselves:
+//   1. candidate contacts from GHL = tag `partner-yipi` ∪ Referral-stage
+//      opportunities (covers historical stage-triggered submissions)
+//   2. for each contact, poll Yipi GET /api/deals/by-correlation/{contactId}
+//      (the documented originator lookup) to get live status
+// Results cached in memory for 60s.
+const GHL_BASE = process.env.GHL_BASE_URL || 'https://services.leadconnectorhq.com';
+let _registryCache = { at: 0, data: null };
+
+async function ghlGet(path) {
+  const res = await fetch(`${GHL_BASE}${path}`, { headers: GHL_HEADERS });
+  let json = null;
+  try { json = await res.json(); } catch { /* non-JSON */ }
+  return { status: res.status, body: json };
+}
+
+async function ghlContactsByTag(tag) {
+  try {
+    const res = await fetch(`${GHL_BASE}/contacts/search`, {
+      method: 'POST',
+      headers: GHL_HEADERS,
+      body: JSON.stringify({
+        locationId: GHL_LOCATION_ID,
+        page: 1,
+        pageLimit: 200,
+        filters: [{ field: 'tags', operator: 'eq', value: tag }],
+      }),
+    });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) {
+      console.warn(`[bridge] GHL contacts/search failed ${res.status}:`, JSON.stringify(json)?.slice(0, 300));
+      return [];
+    }
+    return (json?.contacts || []).map((c) => ({
+      id: c.id,
+      name: [c.firstName, c.lastName].filter(Boolean).join(' ') || c.contactName || c.email || c.id,
+    }));
+  } catch (err) {
+    console.warn('[bridge] GHL contacts/search error:', err.message);
+    return [];
+  }
+}
+
+async function ghlReferralStageContacts() {
+  try {
+    // find the "Referral" stage id in the configured pipeline
+    const pipes = await ghlGet(`/opportunities/pipelines?locationId=${GHL_LOCATION_ID}`);
+    if (pipes.status !== 200) {
+      console.warn(`[bridge] GHL pipelines fetch failed ${pipes.status}`);
+      return [];
+    }
+    const pipeline = (pipes.body?.pipelines || []).find((p) => p.id === GHL_PIPELINE_ID) ||
+                     (pipes.body?.pipelines || [])[0];
+    const stage = (pipeline?.stages || []).find((s) => /referral/i.test(s.name || ''));
+    if (!stage) return [];
+
+    const opps = await ghlGet(
+      `/opportunities/search?location_id=${GHL_LOCATION_ID}&pipeline_id=${pipeline.id}&pipeline_stage_id=${stage.id}&limit=100`
+    );
+    if (opps.status !== 200) {
+      console.warn(`[bridge] GHL opportunities search failed ${opps.status}`);
+      return [];
+    }
+    return (opps.body?.opportunities || [])
+      .map((o) => ({
+        id: o.contact?.id || o.contactId,
+        name: o.contact?.name || o.name || o.contact?.email || o.contactId,
+      }))
+      .filter((c) => c.id);
+  } catch (err) {
+    console.warn('[bridge] GHL referral stage lookup error:', err.message);
+    return [];
+  }
+}
+
+async function mapWithConcurrency(items, limit, fn) {
+  const out = [];
+  let i = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) {
+      const idx = i++;
+      out[idx] = await fn(items[idx]);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+export async function handleYipiRegistry(req, res, query) {
+  if (!authorize(req, res)) return;
+
+  const force = query.get('refresh') === '1';
+  if (!force && _registryCache.data && Date.now() - _registryCache.at < 60_000) {
+    return res.status(200).json({ ..._registryCache.data, cached: true });
+  }
+
+  try {
+    // 1. candidate contacts from GHL (tag flow + historical stage flow)
+    const [tagged, referral] = await Promise.all([
+      ghlContactsByTag('partner-yipi'),
+      ghlReferralStageContacts(),
+    ]);
+    const byId = new Map();
+    for (const c of [...tagged, ...referral]) {
+      if (c.id && !byId.has(c.id)) byId.set(c.id, c);
+    }
+    const candidates = [...byId.values()];
+
+    // 2. live status from Yipi via the originator correlation lookup
+    const WITHDRAWABLE = ['received', 'processing', 'active', 'under_review'];
+    const checks = await mapWithConcurrency(candidates, 8, async (c) => {
+      const out = await yipiGet(`/api/deals/by-correlation/${encodeURIComponent(c.id)}`);
+      if (out.status !== 200) return null; // 404 = never submitted / not found
+      const d = out.body?.data || {};
+      return {
+        dealId: d.id,
+        contactId: c.id,
+        borrower_name: d.borrower_name || c.name,
+        deal_type: d.deal_type,
+        status: d.status,
+        loan_amount: d.loan_amount,
+        property_city: d.property_city,
+        property_state: d.property_state,
+        ingested_at: d.ingested_at,
+        withdrawable: WITHDRAWABLE.includes(d.status),
+      };
+    });
+    const deals = checks.filter(Boolean)
+      .sort((a, b) => new Date(b.ingested_at || 0) - new Date(a.ingested_at || 0));
+
+    const payload = {
+      success: true,
+      checked_contacts: candidates.length,
+      totalCount: deals.length,
+      generated_at: new Date().toISOString(),
+      items: deals,
+    };
+    _registryCache = { at: Date.now(), data: payload };
+    console.log(`[bridge] registry: ${candidates.length} contacts checked, ${deals.length} deals on Yipi`);
+    return res.status(200).json(payload);
+  } catch (err) {
+    console.error('[bridge] Fatal error (registry):', err);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
 // ─── HANDLER: YIPI WITHDRAW (deal removal) ───────────────────────
 // Accepts EITHER { dealId } (dashboard) OR a GHL webhook payload with a
 // contact id (tag flow) — resolves to the deal and withdraws it.
@@ -714,11 +862,16 @@ export async function route(path, req, res, query) {
     if (p === '/yipi/deals') {
       return handleYipiDeals(req, res, query || new URLSearchParams());
     }
+    if (p === '/yipi/registry') {
+      return handleYipiRegistry(req, res, query || new URLSearchParams());
+    }
     return res.status(405).json({ error: 'Method not allowed' });
   }
   switch (p) {
     case '/yipi/deals':
       return handleYipiDeals(req, res, query || new URLSearchParams());
+    case '/yipi/registry':
+      return handleYipiRegistry(req, res, query || new URLSearchParams());
     case '/yipi/submit':
       return handleYipiSubmit(req, res, { requireDealType: true });
     case '/yipi/withdraw':
