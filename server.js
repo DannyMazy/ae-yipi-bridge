@@ -1,14 +1,18 @@
 /**
- * Production HTTP server — AE → Partner Bridge (v2)
+ * Production HTTP server — AE → Partner Bridge (v2.1)
  * Deploy to Render, Railway, or any Node 20+ host.
  * PORT is injected by the platform automatically.
  *
- * Routes (POST, guarded by x-bridge-secret inside bridge.js):
- *   /yipi/submit        submit deal to Yipi (deal type from tags — REQUIRED)
- *   /yipi/withdraw      withdraw ("remove") a submitted Yipi deal
- *   /soldandstay/submit log lead to the Google Sheet only
- *   /stayfrank/submit   stub until StayFrank API spec is final
- *   /  (or anything)    legacy — same as v1 (Yipi submit, YIPI_APP_TYPE fallback)
+ * Routes (guarded by x-bridge-secret inside bridge.js):
+ *   GET  /yipi/deals        list deals submitted to Yipi (live status)
+ *   POST /yipi/submit       submit deal to Yipi (deal type from tags — REQUIRED)
+ *   POST /yipi/withdraw     withdraw a deal — by { dealId } or GHL contact payload
+ *   POST /soldandstay/submit log lead to the Google Sheet only
+ *   POST /stayfrank/submit  stub until StayFrank API spec is final
+ *   POST /  (or anything)   legacy — same as v1 (Yipi submit, YIPI_APP_TYPE fallback)
+ *
+ * CORS is enabled so the Afford Equity deals dashboard (runs in the
+ * Claude desktop app) can call /yipi/deals and /yipi/withdraw directly.
  */
 
 import { createServer } from 'node:http';
@@ -16,24 +20,38 @@ import { route } from './bridge.js';
 
 const PORT = process.env.PORT || 3099;
 
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, x-bridge-secret',
+  'Access-Control-Max-Age': '86400',
+};
+
 const server = createServer((req, res) => {
-  const path = (req.url || '/').split('?')[0];
+  const url = new URL(req.url || '/', 'http://localhost');
+  const path = url.pathname;
+
+  // CORS preflight
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, CORS_HEADERS);
+    res.end();
+    return;
+  }
 
   // Health check — Render pings / to verify the service is up
   if (req.method === 'GET' && path === '/') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, { 'Content-Type': 'application/json', ...CORS_HEADERS });
     res.end(JSON.stringify({
       status: 'ok',
       service: 'ae-yipi-bridge',
-      version: '2.0.0',
-      routes: ['POST /yipi/submit', 'POST /yipi/withdraw', 'POST /soldandstay/submit', 'POST /stayfrank/submit'],
+      version: '2.1.0',
+      routes: ['GET /yipi/deals', 'POST /yipi/submit', 'POST /yipi/withdraw', 'POST /soldandstay/submit', 'POST /stayfrank/submit'],
     }));
     return;
   }
 
-  // Only accept POST otherwise
-  if (req.method !== 'POST') {
-    res.writeHead(405, { 'Content-Type': 'application/json' });
+  if (req.method !== 'POST' && req.method !== 'GET') {
+    res.writeHead(405, { 'Content-Type': 'application/json', ...CORS_HEADERS });
     res.end(JSON.stringify({ error: 'Method not allowed' }));
     return;
   }
@@ -49,21 +67,21 @@ const server = createServer((req, res) => {
       _code: 200,
       status(code) { this._code = code; return this; },
       json(data) {
-        res.writeHead(this._code, { 'Content-Type': 'application/json' });
+        res.writeHead(this._code, { 'Content-Type': 'application/json', ...CORS_HEADERS });
         res.end(JSON.stringify(data));
       },
     };
 
     try {
-      await route(path, req, mockRes);
+      await route(path, req, mockRes, url.searchParams);
     } catch (err) {
       console.error('[server] Unhandled error:', err);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.writeHead(500, { 'Content-Type': 'application/json', ...CORS_HEADERS });
       res.end(JSON.stringify({ error: 'Internal server error' }));
     }
   });
 });
 
 server.listen(PORT, () =>
-  console.log(`🌉 AE→Partner Bridge v2 listening on port ${PORT}`)
+  console.log(`🌉 AE→Partner Bridge v2.1 listening on port ${PORT}`)
 );

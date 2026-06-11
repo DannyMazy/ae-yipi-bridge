@@ -496,32 +496,86 @@ export async function handleYipiSubmit(req, res, { requireDealType }) {
   }
 }
 
+// ─── HANDLER: YIPI DEALS LIST (visibility) ───────────────────────
+// GET /yipi/deals?page=1&perPage=100&status=&search=&deal_type=
+// Proxies Yipi's GET /api/deals so the Afford Equity dashboard can show
+// every deal this API key has submitted, with live status.
+export async function handleYipiDeals(req, res, query) {
+  if (!authorize(req, res)) return;
+
+  const params = new URLSearchParams();
+  params.set('page', query.get('page') || '1');
+  params.set('perPage', query.get('perPage') || '100');
+  params.set('sortBy', query.get('sortBy') || 'created_at');
+  params.set('sortDirection', query.get('sortDirection') || 'DESC');
+  for (const k of ['status', 'search', 'deal_type', 'date_from', 'date_to']) {
+    if (query.get(k)) params.set(k, query.get(k));
+  }
+
+  try {
+    const out = await yipiGet(`/api/deals?${params.toString()}`);
+    if (out.status !== 200) {
+      console.error(`[bridge] deals list failed ${out.status}:`, JSON.stringify(out.body)?.slice(0, 400));
+      return res.status(502).json({ success: false, yipiStatus: out.status, yipiError: out.body });
+    }
+    const data = out.body?.data || {};
+    const items = (data.items || []).map((d) => ({
+      dealId: d.id,
+      external_id: d.external_id, // = GHL contact id when submitted via this bridge
+      borrower_name: d.borrower_name,
+      deal_type: d.deal_type,
+      status: d.status,
+      loan_amount: d.loan_amount,
+      property_city: d.property_city,
+      property_state: d.property_state,
+      ingested_at: d.ingested_at,
+      withdrawable: ['received', 'processing', 'active', 'under_review'].includes(d.status),
+    }));
+    return res.status(200).json({
+      success: true,
+      totalCount: data.totalCount ?? items.length,
+      page: data.pagination?.page ?? 1,
+      totalPages: data.pagination?.totalPages ?? 1,
+      items,
+    });
+  } catch (err) {
+    console.error('[bridge] Fatal error (deals list):', err);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
 // ─── HANDLER: YIPI WITHDRAW (deal removal) ───────────────────────
+// Accepts EITHER { dealId } (dashboard) OR a GHL webhook payload with a
+// contact id (tag flow) — resolves to the deal and withdraws it.
 export async function handleYipiWithdraw(req, res) {
   if (!authorize(req, res)) return;
   const body = parseBody(req, res);
   if (!body) return;
 
+  const directDealId = body.dealId || body.deal_id;
   const contactId = extractContactId(body);
-  if (!contactId) {
+  if (!directDealId && !contactId) {
     return res.status(400).json({
-      error: 'No contactId in payload',
+      error: 'No dealId or contactId in payload',
       received: Object.keys(body || {}),
     });
   }
 
   const custom = body.customData || body.custom_data || {};
-  const reason = custom.withdraw_reason || custom.reason || 'Withdrawn by Afford Equity via CRM';
+  const reason = body.reason || custom.withdraw_reason || custom.reason || 'Withdrawn by Afford Equity via CRM';
 
   try {
-    // 1. Find the deal by our correlation id (user_id = GHL contact id)
-    const lookup = await yipiGet(`/api/deals/by-correlation/${encodeURIComponent(String(contactId))}`);
+    // 1. Find the deal — by id (dashboard) or by correlation id (tag flow)
+    const lookupPath = directDealId
+      ? `/api/deals/${encodeURIComponent(String(directDealId))}`
+      : `/api/deals/by-correlation/${encodeURIComponent(String(contactId))}`;
+    const lookup = await yipiGet(lookupPath);
     if (lookup.status === 404) {
-      console.warn(`[bridge] withdraw: no deal for contact ${contactId}`);
+      console.warn(`[bridge] withdraw: no deal found (${directDealId || contactId})`);
       return res.status(404).json({
         success: false,
         error: 'deal_not_found',
-        message: 'No Yipi deal exists for this contact.',
+        message: directDealId ? 'Deal not found on Yipi.' : 'No Yipi deal exists for this contact.',
       });
     }
     if (lookup.status !== 200) {
@@ -654,9 +708,17 @@ async function logToSheet(contact, body, yipiPayload, notes, contactId, yipiRes,
 }
 
 // ─── ROUTER (used by server.js) ──────────────────────────────────
-export async function route(path, req, res) {
+export async function route(path, req, res, query) {
   const p = (path || '/').replace(/\/+$/, '') || '/';
+  if (req.method === 'GET') {
+    if (p === '/yipi/deals') {
+      return handleYipiDeals(req, res, query || new URLSearchParams());
+    }
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
   switch (p) {
+    case '/yipi/deals':
+      return handleYipiDeals(req, res, query || new URLSearchParams());
     case '/yipi/submit':
       return handleYipiSubmit(req, res, { requireDealType: true });
     case '/yipi/withdraw':
